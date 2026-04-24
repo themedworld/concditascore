@@ -1,152 +1,177 @@
 # app.py
 import os
 import re
-import hashlib
 import time
+import hashlib
 from typing import List, Optional, Dict, Any
 
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-
-# huggingface client
 from huggingface_hub import InferenceClient
 
-# load .env
+# ===============================
+# LOAD ENV
+# ===============================
 load_dotenv()
 
-# Config
 HF_TOKEN = os.getenv("HUGGINGFACE_HUB_TOKEN")
+
+if not HF_TOKEN:
+    raise RuntimeError("HUGGINGFACE_HUB_TOKEN not found")
+
 MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 CACHE_TTL = 3600
 
-if not HF_TOKEN:
-    raise RuntimeError("HUGGINGFACE_HUB_TOKEN not set in .env or environment")
-
-# init client (uses provider default; you can pass provider="nscale" if needed)
 client = InferenceClient(api_key=HF_TOKEN)
 
-# simple in-memory cache for embeddings
+app = FastAPI(title="CV Scorer API")
+
+# ===============================
+# CACHE
+# ===============================
 _embed_cache: Dict[str, Any] = {}
 
-def _cache_key(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-def cache_get(key: str):
-    entry = _embed_cache.get(key)
-    if not entry:
+def cache_key(text: str):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def cache_get(key):
+    if key not in _embed_cache:
         return None
-    ts, value = entry
+
+    ts, val = _embed_cache[key]
+
     if time.time() - ts > CACHE_TTL:
         del _embed_cache[key]
         return None
-    return value
 
-def cache_set(key: str, value):
+    return val
+
+
+def cache_set(key, value):
     _embed_cache[key] = (time.time(), value)
 
-def normalize_text(s: Optional[str]) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
 
-def get_embedding(text: str) -> np.ndarray:
-    key = _cache_key(text)
-    cached = cache_get(key)
-    if cached is not None:
-        return cached
+# ===============================
+# HELPERS
+# ===============================
+def clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip())
 
-    # appel InferenceClient pour embeddings
-    # la méthode 'embeddings' retourne généralement une liste/array de floats
-    try:
-        resp = client.embeddings(model=MODEL_ID, inputs=text)
-    except Exception as e:
-        raise RuntimeError(f"Hugging Face InferenceClient error: {e}")
 
-    # resp peut être une liste de floats ou structure imbriquée ; normaliser en numpy array
-    if isinstance(resp, dict) and "error" in resp:
-        raise RuntimeError(f"HF error: {resp['error']}")
-    # si resp est une liste de listes (token vectors), tenter d'extraire un vecteur poolé
-    vec = None
-    if isinstance(resp, list):
-        # si c'est une liste de nombres -> vecteur direct
-        if resp and isinstance(resp[0], (int, float)):
-            vec = np.array(resp, dtype=float)
-        else:
-            # chercher récursivement le premier vecteur numérique
-            def find_vector(obj):
-                if isinstance(obj, list) and obj and isinstance(obj[0], (int, float)):
-                    return obj
-                if isinstance(obj, list):
-                    for it in obj:
-                        v = find_vector(it)
-                        if v is not None:
-                            return v
-                return None
-            v = find_vector(resp)
-            if v is not None:
-                vec = np.array(v, dtype=float)
-    if vec is None:
-        raise RuntimeError("Impossible d'extraire un embedding depuis la réponse HF")
+def cosine(v1, v2):
+    v1 = np.array(v1)
+    v2 = np.array(v2)
 
-    cache_set(key, vec)
-    return vec
+    denom = np.linalg.norm(v1) * np.linalg.norm(v2)
 
-def semantic_similarity(a: str, b: str) -> float:
-    a = normalize_text(a)
-    b = normalize_text(b)
-    if not a or not b:
+    if denom == 0:
         return 0.0
-    emb_a = get_embedding(a)
-    emb_b = get_embedding(b)
-    sim = cosine_similarity([emb_a], [emb_b])[0][0]
-    if sim < 0:
-        sim = (sim + 1) / 2
-    return float(sim)
 
-def keywords_presence_ratio(keywords: List[str], cv_text: str) -> float:
+    return float(np.dot(v1, v2) / denom)
+
+
+# ===============================
+# EMBEDDING VIA SENTENCE SIMILARITY
+# ===============================
+def hf_similarity(text1: str, text2: str) -> float:
+    """
+    HuggingFace sentence similarity API
+    """
+
+    try:
+        result = client.post(
+            json={
+                "inputs": {
+                    "source_sentence": text1,
+                    "sentences": [text2]
+                }
+            },
+            model=MODEL_ID
+        )
+
+        if isinstance(result, bytes):
+            import json
+            result = json.loads(result.decode())
+
+        return float(result[0])
+
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+
+# ===============================
+# KEYWORDS SCORE
+# ===============================
+def keyword_score(keywords: List[str], cv_text: str) -> float:
     if not keywords:
         return 0.0
-    cv = normalize_text(cv_text).lower()
+
+    cv = cv_text.lower()
+
     found = 0
-    for k in keywords:
-        if not k:
-            continue
-        if re.search(r"\b" + re.escape(k.lower()) + r"\b", cv):
+
+    for kw in keywords:
+        if kw.lower() in cv:
             found += 1
+
     return found / len(keywords)
 
-def combined_score(semantic: float, kw_ratio: float, w_semantic: float = 0.8, w_kw: float = 0.2) -> float:
-    s = w_semantic * semantic + w_kw * kw_ratio
-    return round(s * 100, 2)
 
-# FastAPI
+# ===============================
+# FINAL SCORE
+# ===============================
+def final_score(semantic: float, keywords: float):
+    score = semantic * 0.8 + keywords * 0.2
+    return round(score * 100, 2)
+
+
+# ===============================
+# REQUEST MODEL
+# ===============================
 class ScoreRequest(BaseModel):
     job_title: Optional[str] = None
     job_text: str
     job_keywords: Optional[List[str]] = []
     cv_text: str
 
-app = FastAPI(title="CV Scorer - HF InferenceClient")
 
+# ===============================
+# ROUTES
+# ===============================
 @app.post("/score")
-async def score(payload: ScoreRequest) -> Dict[str, Any]:
-    if not payload.job_text or not payload.cv_text:
-        raise HTTPException(status_code=400, detail="job_text and cv_text are required")
+async def score(data: ScoreRequest):
+
     try:
-        semantic = semantic_similarity(payload.job_text, payload.cv_text)
-    except RuntimeError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    kw_ratio = keywords_presence_ratio(payload.job_keywords or [], payload.cv_text)
-    final = combined_score(semantic, kw_ratio)
-    return {
-        "job_title": payload.job_title,
-        "semantic_similarity": round(semantic, 4),
-        "keyword_presence_ratio": round(kw_ratio, 4),
-        "final_score_percent": final
-    }
+        semantic = hf_similarity(
+            clean_text(data.job_text),
+            clean_text(data.cv_text)
+        )
+
+        kw = keyword_score(
+            data.job_keywords,
+            data.cv_text
+        )
+
+        score = final_score(semantic, kw)
+
+        return {
+            "job_title": data.job_title,
+            "semantic_similarity": round(semantic, 4),
+            "keyword_presence_ratio": round(kw, 4),
+            "final_score_percent": score
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MODEL_ID, "cache_size": len(_embed_cache)}
+    return {
+        "status": "ok",
+        "model": MODEL_ID
+    }
