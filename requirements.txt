@@ -4,3 +4,4 @@ pydantic
 requests
 numpy
 scikit-learn
+python-dotenv
