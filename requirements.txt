@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
 pydantic
-requests
+python-dotenv
+huggingface-hub
 numpy
 scikit-learn
-python-dotenv
