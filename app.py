@@ -257,12 +257,19 @@ async def score(data: ScoreRequest):
 
         # Pondération finale
         # expérience 35% | éducation 20% | skills 30% | niveau 15%
-        final_score = round(
+        def clamp(v): return round(max(0.0, min(100.0, v)), 2)
+
+        # Clamp tous les scores individuels
+        exp_result["score"]    = clamp(exp_result["score"])
+        edu_result["score"]    = clamp(edu_result["score"])
+        skills_result["score"] = clamp(skills_result["score"])
+        level_result["score"]  = clamp(level_result["score"])
+
+        final_score = clamp(
             exp_result["score"] * 0.35
             + edu_result["score"] * 0.20
             + skills_result["score"] * 0.30
-            + level_result["score"] * 0.15,
-            2,
+            + level_result["score"] * 0.15
         )
 
         return {
